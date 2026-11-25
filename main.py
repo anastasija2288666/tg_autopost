@@ -111,4 +111,107 @@ async def publish_post(bot: Bot, chat_id: int, content_type: str, content_data: 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    if not is
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Доступ закрыт.")
+        return
+
+    await message.answer(
+        "👋 <b>Бот отложенного автопостинга готов!</b>\n\nВыберите нужное действие:",
+        parse_mode="HTML",
+        reply_markup=main_menu()
+    )
+
+@router.callback_query(F.data == "back_main")
+async def cb_back_main(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(
+        "👋 <b>Главное меню автопостинга</b>\n\nВыберите действие:",
+        parse_mode="HTML",
+        reply_markup=main_menu()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "my_channels")
+async def cb_my_channels(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id, title, username FROM channels")
+        rows = await cur.fetchall()
+
+    buttons = []
+    text = "📢 <b>Подключённые каналы:</b>\n\n"
+    if not rows:
+        text += "Пока нет добавленных каналов."
+    else:
+        for r in rows:
+            uname = f" (@{r['username']})" if r["username"] else ""
+            text += f"• <b>{r['title']}</b>{uname}\n"
+            buttons.append([red_btn(f"🗑 Удалить: {r['title']}", callback_data=f"del_ch_{r['id']}")])
+
+    buttons.append([green_btn("➕ Добавить канал", callback_data="add_channel")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+@router.callback_query(F.data == "add_channel")
+async def cb_add_channel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(ChannelStates.waiting_channel)
+    await callback.message.edit_text(
+        "📢 <b>Подключение канала</b>\n\n"
+        "1. Добавьте бота в администраторы вашего канала (с правом публикации сообщений).\n"
+        "2. Отправьте сюда <b>@username</b> канала или просто <b>перешлите любой пост</b> из него.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[red_btn("❌ Отмена", callback_data="my_channels")]])
+    )
+    await callback.answer()
+
+@router.message(ChannelStates.waiting_channel)
+async def process_add_channel(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        return
+
+    target = None
+    if message.forward_from_chat and message.forward_from_chat.type == "channel":
+        target = message.forward_from_chat.id
+    elif message.text:
+        target = message.text.strip()
+
+    if not target:
+        await message.answer("⚠️ Пришлите @username канала или перешлите пост из него.")
+        return
+
+    try:
+        chat = await bot.get_chat(target)
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat.id, me.id)
+        if member.status not in ("administrator", "creator"):
+            await message.answer("❌ Бот не является администратором этого канала! Выдайте права и попробуйте снова.")
+            return
+    except Exception as e:
+        await message.answer(f"❌ Не удалось подключить канал.\nОшибка: {e}")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO channels (chat_id, title, username) VALUES (?, ?, ?)",
+            (chat.id, chat.title or "Канал", chat.username)
+        )
+        await db.commit()
+
+    await state.clear()
+    await message.answer(f"✅ Канал <b>{chat.title}</b> подключён!", parse_mode="HTML", reply_markup=main_menu())
+
+@router.callback_query(F.data.startswith("del_ch_"))
+async def cb_del_channel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    ch_id = int(callback.data.split("_")[-1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM channels WHERE id = ?", (ch_id,))
